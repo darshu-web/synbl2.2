@@ -111,6 +111,14 @@ function resolveProviderMeta(rawResult) {
     };
   }
 
+  if (source.includes("radar")) {
+    return {
+      id: "radar_local",
+      label: "RADAR (Local HuggingFace Model)",
+      enginePrefix: "RADAR",
+    };
+  }
+
   if (source.includes("heuristic")) {
     return {
       id: "heuristic_fallback",
