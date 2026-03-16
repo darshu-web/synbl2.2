@@ -1,6 +1,10 @@
 const DEFAULT_DIVEYE_SPACE_URL = "https://pinyuchen-diveye-ai-text-detector.hf.space";
 const DEFAULT_DIVEYE_ENDPOINT = "detect_ai_text";
 
+// DivEye runs on Hugging Face Zero GPU — it cold-starts and may need up to 30s
+// to load the model. The retry delays below are intentionally long to handle this.
+const COLD_START_RETRY_DELAYS_MS = [5000, 10000, 15000];
+
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
@@ -77,7 +81,11 @@ function parseSseResponse(rawBody) {
 
   const errorEvent = [...events].reverse().find((e) => e.event === "error");
   if (errorEvent) {
-    const errorPayload = errorEvent.data || "unknown";
+    // null data means Zero GPU cold-start / model not yet loaded — mark as retriable
+    const errorPayload = errorEvent.data;
+    if (!errorPayload || errorPayload === "null") {
+      throw new Error("diveye_model_not_loaded");
+    }
     throw new Error(`diveye_remote_error:${errorPayload}`);
   }
 
@@ -182,6 +190,11 @@ function shouldRetry(error) {
   );
 }
 
+function isColdStartError(error) {
+  const message = String(error?.message || "").toLowerCase();
+  return message.includes("diveye_model_not_loaded");
+}
+
 function getEndpointCandidates(primaryEndpoint) {
   const candidates = [primaryEndpoint];
   if (primaryEndpoint === DEFAULT_DIVEYE_ENDPOINT) {
@@ -194,11 +207,43 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Send a lightweight "wake-up" ping to the space so the Zero GPU starts loading
+ * the model while we wait. Errors are intentionally ignored — this is best-effort.
+ */
+async function warmUpSpace(baseUrl, endpoint) {
+  try {
+    const resp = await fetchWithTimeout(
+      `${baseUrl}/gradio_api/call/${endpoint}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ data: ["hi"] }),
+      },
+      8000
+    );
+    if (resp.ok) {
+      const json = await resp.json();
+      const eventId = String(json?.event_id || "").trim();
+      if (eventId) {
+        // Drain the result stream in the background — we don't care about the outcome
+        fetchWithTimeout(
+          `${baseUrl}/gradio_api/call/${endpoint}/${eventId}`,
+          { method: "GET" },
+          10000
+        ).catch(() => {});
+      }
+    }
+  } catch {
+    // Warm-up failed — that's OK, real requests will still retry.
+  }
+}
+
 export function isDiveyeEnabled() {
   return process.env.AI_DIVEYE_ENABLED !== "false";
 }
 
-export async function scoreWithDiveye(text, timeoutMs = 45000) {
+export async function scoreWithDiveye(text, timeoutMs = 60000) {
   const normalizedText = typeof text === "string" ? text.trim() : String(text || "").trim();
   if (!normalizedText) {
     return {
@@ -217,10 +262,24 @@ export async function scoreWithDiveye(text, timeoutMs = 45000) {
   const endpointCandidates = getEndpointCandidates(endpoint);
   let result = null;
   let lastError = null;
+  let coldStartDetected = false;
 
   for (const endpointName of endpointCandidates) {
-    for (let attempt = 0; attempt < 3; attempt += 1) {
+    const maxAttempts = COLD_START_RETRY_DELAYS_MS.length + 1;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       try {
+        // On first cold-start detection, send a warm-up ping and wait
+        if (attempt === 1 && coldStartDetected) {
+          console.log("[DivEye] Cold-start detected — sending warm-up ping and waiting...");
+          warmUpSpace(baseUrl, endpointName);
+          await delay(COLD_START_RETRY_DELAYS_MS[0]);
+        } else if (attempt > 1) {
+          const waitMs = COLD_START_RETRY_DELAYS_MS[attempt - 1] ?? 15000;
+          console.log(`[DivEye] Retry attempt ${attempt} — waiting ${waitMs / 1000}s for model warm-up...`);
+          await delay(waitMs);
+        }
+
         const eventId = await getEventId(
           baseUrl,
           endpointName,
@@ -231,10 +290,14 @@ export async function scoreWithDiveye(text, timeoutMs = 45000) {
         break;
       } catch (error) {
         lastError = error;
-        if (!shouldRetry(error) || attempt === 2) {
+
+        if (isColdStartError(error)) {
+          coldStartDetected = true;
+        }
+
+        if (!shouldRetry(error) || attempt === maxAttempts - 1) {
           break;
         }
-        await delay(400 * (attempt + 1));
       }
     }
 

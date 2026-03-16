@@ -1,5 +1,7 @@
-import { detectAIContent } from "../server/aiDetector.js";
+import { config } from "dotenv";
+config();
 
+import { detectAIContent } from "../server/aiDetector.js";
 const sampleSpecs = [
   {
     id: "human_1",
